@@ -14,14 +14,14 @@ const unterminated = [
 
 for (const input of unterminated) {
   test(`rejects a missing closing quote: ${JSON.stringify(input)}`, () => {
-    assert.throws(
-      () => tokenize(input),
-      { name: "SyntaxError", message: "Unterminated string literal" },
-    )
-    assert.throws(
-      () => parseToPrimitiveSExpr(input),
-      { name: "SyntaxError", message: "Unterminated string literal" },
-    )
+    assert.throws(() => tokenize(input), {
+      name: "SyntaxError",
+      message: "Unterminated string literal",
+    })
+    assert.throws(() => parseToPrimitiveSExpr(input), {
+      name: "SyntaxError",
+      message: "Unterminated string literal",
+    })
   })
 }
 
@@ -41,10 +41,10 @@ for (const [input, value] of valid) {
 }
 
 test("unterminated escapes keep their specific diagnostic", () => {
-  assert.throws(
-    () => tokenize('"abc' + "\\"),
-    { name: "SyntaxError", message: "Unterminated escape in string" },
-  )
+  assert.throws(() => tokenize('"abc' + "\\"), {
+    name: "SyntaxError",
+    message: "Unterminated escape in string",
+  })
 })
 
 test("a trailing incomplete string does not return earlier complete forms", () => {
