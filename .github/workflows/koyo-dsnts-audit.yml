@@ -137,7 +137,17 @@ jobs:
               result['fixtures_sha256'] = {
                   str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in demos
               }
-              _, dependencies = run('resolved-dependencies', ['bun', 'pm', 'ls', '--all'])
+              # This project disables lockfile saving; inspect installed package manifests.
+              installed = []
+              for manifest in sorted(Path('node_modules').rglob('package.json')):
+                  try:
+                      package = json.loads(manifest.read_text())
+                      if package.get('name') and package.get('version'):
+                          installed.append({'path': str(manifest), 'name': package['name'],
+                                            'version': package['version']})
+                  except (OSError, ValueError):
+                      continue
+              (evidence / 'resolved-packages.json').write_text(json.dumps(installed, indent=2) + '\n')
               for lock in ('bun.lock', 'bun.lockb'):
                   path = Path(lock)
                   if path.exists():
