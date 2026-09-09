@@ -1,0 +1,171 @@
+name: DSN pinned full-suite audit
+
+on:
+  push:
+    branches: [koyo/dsnts-full-suite-audit-20260909]
+    paths: [.github/workflows/koyo-dsnts-audit.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dsnts-full-suite-audit-20260909
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    if: github.repository == 'ugin-man/dsnts'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        case: [baseline-fixtures, pr18, pr19, pr20, pr22, pr23, pr24, combined-six, combined-with-13]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: tscircuit/dsnts
+          ref: 824919b9878ba3f592428bc586cf2c3ff2466cd0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Run full native checks on pinned source combinations
+        env:
+          AUDIT_CASE: ${{ matrix.case }}
+        shell: bash
+        run: |
+          python3 - <<'AUDIT_PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          
+          BASE = '824919b9878ba3f592428bc586cf2c3ff2466cd0'
+          HEADS = {
+              '13': '23f2247c1e3f1dbc3fe2cb2e4e86841e2f74f872',
+              '14': '15638f663b4d0ead5cd9116b1e6424f9bd2fa402',
+              '18': '321b34d2a129ac9c4b91e72200b883ee16088ba5',
+              '19': 'f094b1fab36c7381cf398dc44899a9821feba122',
+              '20': 'bcc93ecbbc3f88d0d7d4cb8692772bcffa222323',
+              '22': '0ebc3db802a2e0af2d8df85421ead747f85a4ed2',
+              '23': '30fb549b10ba85e1b68b1e335f9286043b5bf896',
+              '24': 'd520153b9a428aefc75f98cdd94be177168a276c',
+          }
+          CASES = {
+              'baseline-fixtures': [],
+              **{f'pr{n}': [n] for n in ('18', '19', '20', '22', '23', '24')},
+              'combined-six': ['18', '19', '20', '22', '23', '24'],
+              'combined-with-13': ['13', '18', '19', '20', '22', '23', '24'],
+          }
+          case = os.environ['AUDIT_CASE']
+          if case not in CASES:
+              raise SystemExit('Unknown audit case')
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'dsnts-audit' / case
+          evidence.mkdir(parents=True, exist_ok=True)
+          result = {
+              'case': case, 'base': BASE, 'patches': [], 'checks': {},
+              'fixture_patch': '14', 'upstream_pr_checks_modified': False,
+              'run_id': os.environ.get('GITHUB_RUN_ID'),
+          }
+          
+          
+          def record():
+              (evidence / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
+          
+          
+          def run(name, args, required=True):
+              print(f'::group::{name}', flush=True)
+              try:
+                  completed = subprocess.run(args, stdout=subprocess.PIPE,
+                                             stderr=subprocess.STDOUT, text=True,
+                                             errors='replace', timeout=240)
+                  output = completed.stdout
+                  rc = completed.returncode
+              except subprocess.TimeoutExpired as exc:
+                  output = str(exc)
+                  rc = 124
+              (evidence / f'{name}.log').write_text(output)
+              print(output, flush=True)
+              print('::endgroup::', flush=True)
+              result['checks'][name] = {'command': args, 'exit_code': rc}
+              record()
+              if rc and required:
+                  raise RuntimeError(f'{name} failed with exit code {rc}')
+              return rc, output
+          
+          
+          try:
+              _, checkout = run('checkout-sha', ['git', 'rev-parse', 'HEAD'])
+              if checkout.strip() != BASE:
+                  raise RuntimeError('Checkout differs from the audited base')
+              run('node-version', ['node', '--version'])
+              run('bun-version', ['bun', '--version'])
+              for number in ['14', *CASES[case]]:
+                  expected = HEADS[number]
+                  # Public read-only fetch. Verify the head before executing any PR code.
+                  run(f'fetch-{number}', ['git', 'fetch', '--no-tags', 'origin',
+                                         f'+refs/pull/{number}/head:refs/audit/pr{number}'])
+                  _, actual = run(f'head-{number}', ['git', 'rev-parse', f'refs/audit/pr{number}'])
+                  if actual.strip() != expected:
+                      raise RuntimeError(f'PR {number} changed since audit; refusing stale verification')
+                  _, changed = run(f'files-{number}', ['git', 'diff', '--name-only', BASE, expected])
+                  paths = changed.splitlines()
+                  allowed = (paths == ['scripts/download-demos.ts']) if number == '14' else (
+                      bool(paths) and all(p.startswith(('lib/', 'tests/')) for p in paths)
+                  )
+                  if not allowed:
+                      raise RuntimeError(f'PR {number} has unexpected changed paths')
+                  patch = evidence / f'pr{number}.patch'
+                  with patch.open('wb') as file:
+                      subprocess.run(['git', 'diff', '--binary', BASE, expected],
+                                     stdout=file, check=True, timeout=30)
+                  run(f'apply-{number}', ['git', 'apply', '--3way', str(patch)])
+                  result['patches'].append({'number': number, 'sha': expected, 'paths': paths})
+                  record()
+              run('diff-check', ['git', 'diff', '--cached', '--check'])
+              _, tree_sha = run('combined-tree', ['git', 'write-tree'])
+              result['source_tree_sha'] = tree_sha.strip()
+              run('install', ['bun', 'install'])
+              run('download-demos', ['bun', 'run', 'download-demos'])
+              demos = sorted(Path('demos').glob('*.dsn'))
+              if len(demos) < 7:
+                  raise RuntimeError('Expected all seven demo files, not a partial download')
+              result['fixtures_sha256'] = {
+                  str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in demos
+              }
+              _, dependencies = run('resolved-dependencies', ['bun', 'pm', 'ls', '--all'])
+              for lock in ('bun.lock', 'bun.lockb'):
+                  path = Path(lock)
+                  if path.exists():
+                      (evidence / lock).write_bytes(path.read_bytes())
+              failed = False
+              for name, command in (
+                  ('test', ['bun', 'test']),
+                  ('typecheck', ['bun', 'run', 'typecheck']),
+                  ('format-check', ['bun', 'run', 'format:check']),
+                  ('build', ['bun', 'run', 'build']),
+              ):
+                  rc, _ = run(name, command, required=False)
+                  failed |= rc != 0
+              result['conclusion'] = 'failure' if failed else 'success'
+              record()
+              raise SystemExit(1 if failed else 0)
+          except Exception as exc:
+              result['conclusion'] = 'blocked'
+              result['error'] = str(exc)
+              record()
+              print(f'::error::{exc}', flush=True)
+              raise SystemExit(1)
+          AUDIT_PY
+      - name: Upload logs and provenance even when validation fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsnts-audit-${{ matrix.case }}
+          path: ${{ runner.temp }}/dsnts-audit/${{ matrix.case }}/
+          if-no-files-found: warn
+          retention-days: 7
