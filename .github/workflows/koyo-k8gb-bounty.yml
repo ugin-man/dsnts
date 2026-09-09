@@ -6,68 +6,72 @@ on:
 permissions:
   contents: read
 jobs:
-  collect:
+  verify:
     runs-on: ubuntu-latest
     timeout-minutes: 6
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          repository: ugin-man/dsnts
+          ref: 5911b7419f2ca1d617dc2b8344e8e7af89a02017
+          path: submission
+          persist-credentials: false
+          sparse-checkout: bounty/k8gb
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
           repository: pluralsh/console
           ref: 1a738b2f7bfdc9a5f0e62737d90a60c89d8caa10
+          path: console
           persist-credentials: false
           sparse-checkout: |
             utils/compatibility
             static/compatibilities
-      - name: Collect and render published charts without deployment
+      - name: Install deterministic test dependencies only
+        run: python3 -m pip install PyYAML==6.0.2 requests==2.33.0 packaging==24.1 semantic-version==2.10.0 beautifulsoup4==4.12.3 colorama==0.4.6 pytest jsonschema
+      - name: Verify exact implementation and existing compatibility tests
         run: |
-          mkdir -p bounty-evidence/wheels
-          python3 -m pip download --no-deps colorama==0.4.6 -d bounty-evidence/wheels
+          mkdir evidence
           python3 - <<'PY'
-          import datetime, hashlib, io, json, pathlib, re, subprocess, tarfile, urllib.request, urllib.parse
-          import yaml
-          root = pathlib.Path('bounty-evidence')
-          for name in ('KUBE_VERSION','static/compatibilities.yaml'):
-              target=root/'console'/name
-              target.parent.mkdir(parents=True,exist_ok=True)
-              target.write_bytes(subprocess.check_output(['git','show',f'HEAD:{name}']))
-          cap=(root/'console/KUBE_VERSION').read_text().strip()
-          helm=subprocess.check_output(['helm','version','--short'],text=True).strip()
-          def fetch(url):
-              req=urllib.request.Request(url,headers={'User-Agent':'ugin-man-k8gb-compatibility'})
-              with urllib.request.urlopen(req,timeout=30) as response:
-                  data=response.read(15_000_001)
-              if len(data)>15_000_000:raise ValueError('response exceeds limit')
-              return data
-          raw=fetch('https://www.k8gb.io/index.yaml')
-          (root/'k8gb-index.yaml').write_bytes(raw)
-          rows=yaml.safe_load(raw)['entries']['k8gb']
-          report={'helm':helm,'kube_cap':cap,'charts':[],'index_sha256':hashlib.sha256(raw).hexdigest()}
-          for row in rows:
-              if not all(re.fullmatch(r'v?\d+\.\d+\.\d+',str(row.get(k,''))) for k in ('version','appVersion')) or not row.get('kubeVersion') or row.get('deprecated'):
-                  continue
-              url=urllib.parse.urljoin('https://www.k8gb.io/',row['urls'][0])
-              assert urllib.parse.urlsplit(url).hostname=='www.k8gb.io'
-              data=fetch(url)
-              assert hashlib.sha256(data).hexdigest()==row['digest']
-              name='k8gb-'+row['version']+'.tgz'
-              target=root/'charts'/name;target.parent.mkdir(exist_ok=True);target.write_bytes(data)
-              with tarfile.open(fileobj=io.BytesIO(data),mode='r:gz') as archive:
-                  meta=yaml.safe_load(archive.extractfile('k8gb/Chart.yaml').read())
-              for key in ('name','version','appVersion','kubeVersion'):
-                  assert meta.get(key)==row.get(key),(key,row['version'])
-              command=['helm','template','k8gb',str(target),'--kube-version',cap]
-              run=subprocess.run(command,capture_output=True,text=True,timeout=30)
-              (root/(row['version']+'-render.yaml')).write_text(run.stdout)
-              (root/(row['version']+'-render.log')).write_text(run.stderr)
-              (root/(row['version']+'-chart.yaml')).write_text(yaml.safe_dump(meta,sort_keys=False))
-              report['charts'].append({'version':row['version'],'appVersion':row['appVersion'],'kubeVersion':row['kubeVersion'],'url':url,'digest':row['digest'],'render_exit_code':run.returncode})
-          report['captured_utc']=datetime.datetime.now(datetime.timezone.utc).isoformat()
-          (root/'chart-report.json').write_text(json.dumps(report,indent=2))
-          print(json.dumps(report,indent=2))
+          import hashlib,pathlib,shutil
+          p=pathlib.Path('submission/bounty/k8gb/k8gb.py')
+          assert hashlib.sha256(p.read_bytes()).hexdigest()=='da193aace914e00bfb57c8d20244c91d07e61230916d69b6862b413bac09a8df'
+          shutil.copy2(p,'console/utils/compatibility/scrapers/k8gb.py')
+          PY
+          cd console
+          python3 -m pytest utils/compatibility/tests -q | tee ../evidence/existing-tests.log
+      - name: Execute real HTTP and Helm paths twice without deployment
+        run: |
+          python3 - <<'PY' | tee evidence/native.log
+          import hashlib,json,os,pathlib,subprocess,sys
+          import yaml,jsonschema
+          evidence=pathlib.Path('evidence').resolve()
+          repo=pathlib.Path('console').resolve()
+          os.chdir(repo/'utils/compatibility');sys.path.insert(0,str(pathlib.Path.cwd()))
+          import utils
+          from scrapers import k8gb
+          target=repo/'static/compatibilities/k8gb.yaml'
+          meta={'icon':'https://www.k8gb.io/images/k8gb-icon-color.svg','git_url':'https://github.com/k8gb-io/k8gb','release_url':'https://github.com/k8gb-io/k8gb/releases/tag/v{vsn}','helm_repository_url':'https://www.k8gb.io','chart_name':'k8gb','versions':[]}
+          assert utils.write_yaml(str(target),meta)
+          first=k8gb.scrape();first_bytes=target.read_bytes();stamp=target.stat().st_mtime_ns
+          second=k8gb.scrape()
+          assert first==second and first_bytes==target.read_bytes() and target.stat().st_mtime_ns==stamp
+          assert first['versions'] and all(v['images'] for v in first['versions'])
+          for v in first['versions']:
+              assert any(img.rsplit('/',1)[-1] in ('k8gb:v'+v['version'],'k8gb:'+v['version']) for img in v['images'])
+          schema=json.loads((repo/'static/compatibilities/schema.json').read_text())
+          count=0
+          for file in (repo/'static/compatibilities').glob('*.yaml'):
+              jsonschema.validate(yaml.safe_load(file.read_text()),schema);count+=1
+          aggregate=yaml.safe_load((repo/'static/compatibilities.yaml').read_text())
+          jsonschema.validate({'addons':aggregate['addons']+[dict(first,name='k8gb')]},schema)
+          result={'source_sha256':'da193aace914e00bfb57c8d20244c91d07e61230916d69b6862b413bac09a8df','base':'1a738b2f7bfdc9a5f0e62737d90a60c89d8caa10','catalog_rows':len(first['versions']),'versions':[v['version'] for v in first['versions']],'kube_cap':utils.current_kube_version(),'two_live_runs_identical':True,'schema_files_passed':count+1,'previous_aggregate_entries_preserved':len(aggregate['addons']),'helm':subprocess.check_output(['helm','version','--short'],text=True).strip(),'python':sys.version,'table_sha256':hashlib.sha256(first_bytes).hexdigest(),'upstream_submission':False,'cluster_deployment':False}
+          (evidence/'k8gb.yaml').write_bytes(first_bytes)
+          (evidence/'result.json').write_text(json.dumps(result,indent=2))
+          print(json.dumps(result,indent=2))
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: k8gb-chart-verification
-          path: bounty-evidence/
+          name: k8gb-native-verification
+          path: evidence/
           retention-days: 7
